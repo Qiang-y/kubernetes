@@ -497,6 +497,13 @@ func (s *Server) InstallDebuggingHandlers() {
 		To(s.getRunningPods).
 		Operation("getRunningPods"))
 	s.restfulCont.Add(ws)
+
+	// Install CRIU checkpoint/restore handlers (PoC)
+	if crHost, ok := s.host.(CheckpointRestoreInterface); ok {
+		s.installCheckpointRestoreHandlers(crHost)
+	} else {
+		klog.InfoS("Kubelet does not implement CheckpointRestoreInterface, skipping checkpoint/restore handlers")
+	}
 }
 
 // InstallDebuggingDisabledHandlers registers the HTTP request patterns that provide better error message

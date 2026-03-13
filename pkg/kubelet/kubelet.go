@@ -34,6 +34,7 @@ import (
 
 	"k8s.io/client-go/informers"
 
+	"google.golang.org/grpc"
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	libcontaineruserns "github.com/opencontainers/runc/libcontainer/userns"
 	"k8s.io/mount-utils"
@@ -67,6 +68,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/apis/podresources"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	kubeletcertificate "k8s.io/kubernetes/pkg/kubelet/certificate"
+	"k8s.io/kubernetes/pkg/kubelet/checkpoint"
 	"k8s.io/kubernetes/pkg/kubelet/cloudresource"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	"k8s.io/kubernetes/pkg/kubelet/config"
@@ -694,6 +696,58 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	klet.streamingRuntime = runtime
 	klet.runner = runtime
 
+	// Initialize CRIU checkpoint manager
+	checkpointStateDir := path.Join(rootDirectory, "pod-checkpoints")
+	checkpointMgr, err := checkpoint.NewManager(checkpointStateDir)
+	if err != nil {
+		klog.ErrorS(err, "Failed to create checkpoint manager, checkpoint/restore will be disabled")
+	} else {
+		klet.checkpointManager = checkpointMgr
+		// Inject checkpoint manager into runtime manager
+		if setter, ok := runtime.(interface {
+			SetCheckpointManager(mgr *checkpoint.Manager)
+		}); ok {
+			setter.SetCheckpointManager(checkpointMgr)
+			klog.InfoS("Checkpoint manager injected into runtime manager")
+		}
+	}
+
+	// Establish gRPC connection for checkpoint/restore operations.
+	// Get the CRI endpoint: try environment variable first, then common socket paths.
+	criEndpoint := os.Getenv("CONTAINER_RUNTIME_ENDPOINT")
+	if criEndpoint == "" {
+		// Check common containerd socket paths
+		for _, candidate := range []string{
+			"/tmp/k8s-test/containerd.sock",
+			"/run/containerd/containerd.sock",
+		} {
+			if _, statErr := os.Stat(candidate); statErr == nil {
+				criEndpoint = candidate
+				break
+			}
+		}
+	}
+	if criEndpoint != "" {
+		// Strip "unix://" prefix if present for grpc.Dial
+		dialTarget := criEndpoint
+		if strings.HasPrefix(dialTarget, "unix://") {
+			dialTarget = dialTarget[len("unix://"):]
+		}
+		grpcConn, grpcErr := grpc.Dial(
+			"unix://"+dialTarget,
+			grpc.WithInsecure(),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(1024*1024*16)),
+		)
+		if grpcErr != nil {
+			klog.ErrorS(grpcErr, "Failed to establish gRPC connection for checkpoint/restore")
+		} else {
+			kuberuntime.SetGRPCConnection(grpcConn)
+			klog.InfoS("gRPC connection established for checkpoint/restore", "endpoint", criEndpoint)
+		}
+	} else {
+		klog.InfoS("No CRI endpoint found for checkpoint/restore gRPC connection")
+	}
+
 	runtimeCache, err := kubecontainer.NewRuntimeCache(klet.containerRuntime)
 	if err != nil {
 		return nil, err
@@ -1223,6 +1277,9 @@ type Kubelet struct {
 
 	// Handles node shutdown events for the Node.
 	shutdownManager nodeshutdown.Manager
+
+	// CRIU checkpoint manager for Pod-level checkpoint/restore.
+	checkpointManager *checkpoint.Manager
 }
 
 // ListPodStats is delegated to StatsProvider, which implements stats.Provider interface

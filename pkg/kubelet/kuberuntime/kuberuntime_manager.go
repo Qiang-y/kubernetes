@@ -44,6 +44,7 @@ import (
 	"k8s.io/kubernetes/pkg/credentialprovider/plugin"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/kubernetes/pkg/kubelet/checkpoint"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/images"
@@ -159,6 +160,9 @@ type kubeGenericRuntimeManager struct {
 
 	// Memory throttling factor for MemoryQoS
 	memoryThrottlingFactor float64
+
+	// Checkpoint manager for CRIU checkpoint/restore
+	checkpointManager *checkpoint.Manager
 }
 
 // KubeGenericRuntime is a interface contains interfaces for container runtime and command.
@@ -291,6 +295,11 @@ func NewKubeGenericRuntimeManager(
 	)
 
 	return kubeRuntimeManager, nil
+}
+
+// SetCheckpointManager sets the checkpoint manager for CRIU checkpoint/restore.
+func (m *kubeGenericRuntimeManager) SetCheckpointManager(mgr *checkpoint.Manager) {
+	m.checkpointManager = mgr
 }
 
 // Type returns the type of the container runtime.
@@ -651,6 +660,13 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// If container does not exist, or is not running, check whether we
 		// need to restart it.
 		if containerStatus == nil || containerStatus.State != kubecontainer.ContainerStateRunning {
+			// CRIU checkpoint: if container is checkpointed, skip restart
+			if m.checkpointManager != nil && m.checkpointManager.IsCheckpointed(pod.UID, container.Name) {
+				klog.V(3).InfoS("Container is checkpointed, skipping restart",
+					"containerName", container.Name, "pod", klog.KObj(pod))
+				keepCount++
+				continue
+			}
 			if kubecontainer.ShouldContainerBeRestarted(&container, pod, podStatus) {
 				klog.V(3).InfoS("Container of pod is not in the desired state and shall be started", "containerName", container.Name, "pod", klog.KObj(pod))
 				changes.ContainersToStart = append(changes.ContainersToStart, idx)
