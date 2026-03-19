@@ -203,6 +203,20 @@ func (w *worker) doProbe() (keepGoing bool) {
 		return true // Wait for more information.
 	}
 
+	// v2: Skip probes for checkpointed containers.
+	// When a container is checkpointed (terminated with reason "Checkpointed"),
+	// probes must not fire — the container is intentionally frozen, not failed.
+	// Without this check, liveness probe failures would mark the Pod as unhealthy.
+	if c.State.Terminated != nil && c.State.Terminated.Reason == "Checkpointed" {
+		klog.V(3).InfoS("Container is checkpointed, skipping probe",
+			"probeType", w.probeType, "pod", klog.KObj(w.pod), "containerName", w.container.Name)
+		// Set result to Success to prevent health check failures during checkpoint period
+		if !w.containerID.IsEmpty() {
+			w.resultsManager.Set(w.containerID, results.Success, w.pod)
+		}
+		return true // Keep the worker alive — it will resume when container is restored
+	}
+
 	if w.containerID.String() != c.ContainerID {
 		if !w.containerID.IsEmpty() {
 			w.resultsManager.Remove(w.containerID)

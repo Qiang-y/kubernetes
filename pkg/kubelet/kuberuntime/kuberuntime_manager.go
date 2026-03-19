@@ -552,6 +552,18 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 	klog.V(5).InfoS("Syncing Pod", "pod", klog.KObj(pod))
 
 	createPodSandbox, attempt, sandboxID := m.podSandboxChanged(pod, podStatus)
+
+	// v2: Function-level intercept — if Pod is checkpointed, skip ALL actions.
+	// This prevents sandbox rebuild (sandbox was destroyed in v2) and container restart.
+	// Must be checked AFTER podSandboxChanged() but BEFORE any action decisions.
+	if m.checkpointManager != nil && m.checkpointManager.IsPodCheckpointed(pod.UID) {
+		klog.V(3).InfoS("Pod is checkpointed, skipping all actions (sandbox destroyed)",
+			"pod", klog.KObj(pod))
+		return podActions{
+			ContainersToKill: make(map[kubecontainer.ContainerID]containerToKillInfo),
+		}
+	}
+
 	changes := podActions{
 		KillPod:           createPodSandbox,
 		CreateSandbox:     createPodSandbox,
@@ -660,13 +672,6 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// If container does not exist, or is not running, check whether we
 		// need to restart it.
 		if containerStatus == nil || containerStatus.State != kubecontainer.ContainerStateRunning {
-			// CRIU checkpoint: if container is checkpointed, skip restart
-			if m.checkpointManager != nil && m.checkpointManager.IsCheckpointed(pod.UID, container.Name) {
-				klog.V(3).InfoS("Container is checkpointed, skipping restart",
-					"containerName", container.Name, "pod", klog.KObj(pod))
-				keepCount++
-				continue
-			}
 			if kubecontainer.ShouldContainerBeRestarted(&container, pod, podStatus) {
 				klog.V(3).InfoS("Container of pod is not in the desired state and shall be started", "containerName", container.Name, "pod", klog.KObj(pod))
 				changes.ContainersToStart = append(changes.ContainersToStart, idx)

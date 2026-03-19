@@ -40,11 +40,12 @@ type ContainerCheckpointInfo struct {
 
 // CheckpointState stores the checkpoint state for a Pod.
 type CheckpointState struct {
-	PodUID     types.UID                          `json:"podUID"`
-	PodName    string                             `json:"podName"`
-	Namespace  string                             `json:"namespace"`
-	Timestamp  time.Time                          `json:"timestamp"`
-	Containers map[string]ContainerCheckpointInfo `json:"containers"` // container name → info
+	PodUID            types.UID                          `json:"podUID"`
+	PodName           string                             `json:"podName"`
+	Namespace         string                             `json:"namespace"`
+	Timestamp         time.Time                          `json:"timestamp"`
+	Containers        map[string]ContainerCheckpointInfo `json:"containers"`        // container name → info
+	SandboxNetnsInode uint64                             `json:"sandboxNetnsInode"` // v2: netns inode at dump time (0 = unknown/v1 compat)
 }
 
 // Manager manages Pod checkpoint state. It tracks which Pods have been
@@ -79,25 +80,33 @@ func NewManager(stateDir string) (*Manager, error) {
 }
 
 // MarkCheckpointed marks a container within a Pod as checkpointed.
-func (m *Manager) MarkCheckpointed(podUID types.UID, podName, namespace, containerName string, info ContainerCheckpointInfo) error {
+// sandboxNetnsInode is the netns inode recorded at dump time (v2: for CRIU --external net[...] on restore).
+// Pass 0 for v1 compatibility (sandbox preserved, no netns remapping needed).
+func (m *Manager) MarkCheckpointed(podUID types.UID, podName, namespace, containerName string, info ContainerCheckpointInfo, sandboxNetnsInode uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	state, ok := m.states[podUID]
 	if !ok {
 		state = &CheckpointState{
-			PodUID:     podUID,
-			PodName:    podName,
-			Namespace:  namespace,
-			Timestamp:  time.Now(),
-			Containers: make(map[string]ContainerCheckpointInfo),
+			PodUID:            podUID,
+			PodName:           podName,
+			Namespace:         namespace,
+			Timestamp:         time.Now(),
+			Containers:        make(map[string]ContainerCheckpointInfo),
+			SandboxNetnsInode: sandboxNetnsInode,
 		}
 		m.states[podUID] = state
 	}
 
+	// Update sandbox netns inode if provided (last call wins, but they should all be the same for a Pod)
+	if sandboxNetnsInode != 0 {
+		state.SandboxNetnsInode = sandboxNetnsInode
+	}
+
 	state.Containers[containerName] = info
-	klog.Infof("Marked container %s/%s/%s as checkpointed (path=%s)",
-		namespace, podName, containerName, info.CheckpointPath)
+	klog.Infof("Marked container %s/%s/%s as checkpointed (path=%s, sandboxNetnsInode=%d)",
+		namespace, podName, containerName, info.CheckpointPath, state.SandboxNetnsInode)
 
 	return m.persist(podUID)
 }
